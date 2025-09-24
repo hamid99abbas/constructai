@@ -11,6 +11,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import plotly.express as px
 import plotly.graph_objects as go
 import pandas as pd
+from dotenv import load_dotenv
+
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -24,12 +26,40 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# API Configuration
-SERPER_API_KEY = os.getenv("SERPER_API_KEY", "3b5cc83f75f9ef65402a26b139189320d4b285b1")
-OPENROUTER_API_KEY = "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"
-COMPANIES_HOUSE_API_KEY = os.getenv("COMPANIES_HOUSE_API_KEY", "59262e1f-144b-4672-847c-f6d1109b1a25")
-OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "c3a915a9825314dc1bb115fe07166c84").strip()
 
+load_dotenv()
+# API Configuration - Try Streamlit secrets first, then environment variables
+def get_api_key(key_name):
+    """Get API key from Streamlit secrets or environment variables"""
+    try:
+        # Try Streamlit secrets first (for cloud deployment)
+        return st.secrets[key_name]
+    except:
+        # Fallback to environment variables (for local development)
+        return os.getenv(key_name)
+
+# Get API keys securely
+SERPER_API_KEY = get_api_key("SERPER_API_KEY")
+OPENROUTER_API_KEY = get_api_key("OPENROUTER_API_KEY")
+COMPANIES_HOUSE_API_KEY = get_api_key("COMPANIES_HOUSE_API_KEY")
+OPENWEATHER_API_KEY = get_api_key("OPENWEATHER_API_KEY")
+
+# Validate API keys
+missing_keys = []
+if not SERPER_API_KEY:
+    missing_keys.append("SERPER_API_KEY")
+if not OPENROUTER_API_KEY:
+    missing_keys.append("OPENROUTER_API_KEY")
+if not COMPANIES_HOUSE_API_KEY:
+    missing_keys.append("COMPANIES_HOUSE_API_KEY")
+if not OPENWEATHER_API_KEY:
+    missing_keys.append("OPENWEATHER_API_KEY")
+
+if missing_keys:
+    st.error(f"Missing required API keys: {', '.join(missing_keys)}")
+    st.info("If running locally, ensure your .env file is properly configured.")
+    st.info("If running on Streamlit Cloud, check your secrets configuration.")
+    st.stop()
 
 # Initialize session state variables
 def init_session_state():
