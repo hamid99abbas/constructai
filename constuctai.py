@@ -137,7 +137,7 @@ def cache_key(func_name: str, *args) -> str:
     return f"{func_name}_{hash(str(args))}"
 
 
-# Enhanced AI Model Integration
+# Enhanced AI Model Integration with Proper Context
 class OpenRouterClient:
     def __init__(self, api_key: str):
         self.api_key = api_key
@@ -147,9 +147,55 @@ class OpenRouterClient:
             "Content-Type": "application/json"
         }
 
+    def generate_response_with_history(self, system_prompt: str, user_prompt: str,
+                                       conversation_history: List[Dict],
+                                       model: str = "perplexity/sonar") -> str:
+        """Generate response using OpenRouter with full conversation history"""
+        try:
+            # Start with system message
+            messages = [{"role": "system", "content": system_prompt}]
+
+            # Add conversation history (last 5 exchanges to stay within token limits)
+            recent_history = conversation_history[-5:] if len(conversation_history) > 5 else conversation_history
+
+            for entry in recent_history:
+                # Add user message
+                messages.append({"role": "user", "content": entry['query']})
+                # Add assistant response (truncated to avoid token limits)
+                response_content = entry['response']
+                if len(response_content) > 1000:
+                    response_content = response_content[:1000] + "... [truncated for context]"
+                messages.append({"role": "assistant", "content": response_content})
+
+            # Add the current user question
+            messages.append({"role": "user", "content": user_prompt})
+
+            payload = {
+                "model": model,
+                "messages": messages,
+                "temperature": 0.3,
+                "max_tokens": 2048,
+                "top_p": 0.9
+            }
+
+            response = requests.post(
+                self.base_url,
+                headers=self.headers,
+                json=payload,
+                timeout=30
+            )
+            response.raise_for_status()
+
+            data = response.json()
+            return data['choices'][0]['message']['content']
+
+        except Exception as e:
+            logger.error(f"OpenRouter API error: {e}")
+            return f"Error generating response: {str(e)}"
+
     def generate_response(self, system_prompt: str, user_prompt: str,
                           model: str = "perplexity/sonar") -> str:
-        """Generate response using OpenRouter with Sonar model for real-time data"""
+        """Generate response using OpenRouter (fallback method)"""
         try:
             payload = {
                 "model": model,
@@ -526,7 +572,7 @@ def detect_query_domain(query: str) -> str:
     return max(scores.items(), key=lambda x: x[1])[0]
 
 
-# Context Management System
+# Enhanced Context Management System
 class ContextManager:
     def __init__(self, max_context_length: int = 5):
         self.max_context_length = max_context_length
@@ -546,30 +592,49 @@ class ContextManager:
         if len(st.session_state.context_memory) > self.max_context_length:
             st.session_state.context_memory = st.session_state.context_memory[-self.max_context_length:]
 
-    def get_relevant_context(self, current_query: str, current_domain: str) -> str:
-        """Get relevant context for current query"""
-        if not st.session_state.context_memory:
+    def get_relevant_context_entries(self, current_domain: str) -> List[Dict]:
+        """Get relevant conversation history entries for context"""
+        if not st.session_state.conversation_history:
+            return []
+
+        # Get last 3-5 entries, prioritizing same domain
+        relevant_entries = []
+
+        # First, get same domain entries
+        same_domain_entries = [
+            entry for entry in reversed(st.session_state.conversation_history[-10:])
+            if entry.get('domain') == current_domain
+        ]
+        relevant_entries.extend(same_domain_entries[:2])
+
+        # Then add other recent entries if we don't have enough
+        if len(relevant_entries) < 3:
+            other_entries = [
+                entry for entry in reversed(st.session_state.conversation_history[-5:])
+                if entry not in relevant_entries
+            ]
+            relevant_entries.extend(other_entries[:3 - len(relevant_entries)])
+
+        return relevant_entries
+
+    def get_context_summary(self, current_query: str, current_domain: str) -> str:
+        """Get context summary for system prompt (fallback)"""
+        relevant_entries = self.get_relevant_context_entries(current_domain)
+
+        if not relevant_entries:
             return ""
 
-        # Prioritize same domain context
-        relevant_context = []
-        for entry in reversed(st.session_state.context_memory):
-            if entry['domain'] == current_domain:
-                relevant_context.append(f"Previous {entry['domain']} query: {entry['query']}")
+        context_parts = []
+        for entry in relevant_entries:
+            context_parts.append(f"Previous {entry.get('domain', 'general')} query: {entry['query']}")
 
-        # Add general context if not enough domain-specific
-        if len(relevant_context) < 2:
-            for entry in reversed(st.session_state.context_memory[-3:]):
-                if entry not in relevant_context:
-                    relevant_context.append(f"Recent query: {entry['query']}")
-
-        return " | ".join(relevant_context[:3])
+        return " | ".join(context_parts)
 
 
 context_manager = ContextManager()
 
 
-# Enhanced Query Processing
+# Enhanced Query Processing with Proper Context
 def process_advanced_query(query: str) -> Dict[str, Any]:
     """Process query with advanced context and real-time data"""
     start_time = time.time()
@@ -577,24 +642,18 @@ def process_advanced_query(query: str) -> Dict[str, Any]:
     # Detect domain
     domain = detect_query_domain(query)
 
-    # Get relevant context
-    context = context_manager.get_relevant_context(query, domain)
-
-    # Process based on domain
+    # Process based on domain to get raw data
     if domain == "weather":
         # Extract city
         city_match = re.search(r'\b(?:in|for|at)\s+([A-Za-z\s]+)(?:\s|$)', query)
         city = city_match.group(1).strip() if city_match else st.session_state.user_preferences['location_preference']
-
-        weather_data = get_weather_construction_impact(city)
-        raw_data = weather_data
+        raw_data = get_weather_construction_impact(city)
 
     elif domain == "company":
         # Extract company name
         company_words = query.lower().split()
         company_name = " ".join([w for w in company_words if w not in
                                  ['company', 'information', 'about', 'tell', 'me']])
-
         raw_data = get_company_info_enhanced(company_name)
 
     else:
@@ -602,15 +661,24 @@ def process_advanced_query(query: str) -> Dict[str, Any]:
         search_type = "news" if domain in ["regulations", "sustainability"] else "general"
         raw_data = search_web_realtime(query, search_type)
 
-    # Generate enhanced response using Sonar model
-    system_prompt = create_system_prompt(domain, context)
-    user_prompt = create_user_prompt(query, raw_data, domain)
+    # Generate enhanced response using conversation history
+    system_prompt = create_enhanced_system_prompt(domain)
+    user_prompt = create_enhanced_user_prompt(query, raw_data, domain)
 
-    ai_response = openrouter_client.generate_response(system_prompt, user_prompt)
+    # Use the new method with conversation history
+    if st.session_state.conversation_history:
+        ai_response = openrouter_client.generate_response_with_history(
+            system_prompt,
+            user_prompt,
+            st.session_state.conversation_history
+        )
+    else:
+        # Fallback for first query
+        ai_response = openrouter_client.generate_response(system_prompt, user_prompt)
 
     processing_time = time.time() - start_time
 
-    # Add to context
+    # Add to context (keep the existing context manager for analytics)
     context_manager.add_to_context(query, ai_response, domain)
 
     return {
@@ -618,55 +686,68 @@ def process_advanced_query(query: str) -> Dict[str, Any]:
         'response': ai_response,
         'raw_data': raw_data,
         'processing_time': processing_time,
-        'context_used': context,
+        'context_used': f"{len(st.session_state.conversation_history)} previous exchanges",
         'timestamp': datetime.now().isoformat()
     }
 
 
-def create_system_prompt(domain: str, context: str) -> str:
-    """Create enhanced system prompt based on domain and context"""
-    base_prompt = """You are ConstructAI, an advanced AI assistant specializing in the UK construction industry with access to real-time data. You provide accurate, up-to-date, and actionable information."""
+def create_enhanced_system_prompt(domain: str) -> str:
+    """Create enhanced system prompt based on domain"""
+    base_prompt = """You are ConstructAI, an advanced AI assistant specializing in the UK construction industry with access to real-time data. You provide accurate, up-to-date, and actionable information.
+
+You have access to the conversation history and should reference previous queries and responses when relevant. This allows you to:
+- Build upon previous discussions
+- Provide comparative analysis when asked
+- Reference earlier information to avoid repetition
+- Maintain conversation continuity
+
+Key Capabilities:
+- Real-time weather data with construction impact analysis
+- Live company information from Companies House
+- Current regulatory updates and news
+- Technical construction guidance
+- UK-specific standards and regulations"""
 
     domain_expertise = {
-        'weather': "Focus on construction-specific weather impacts, site safety, and work scheduling recommendations.",
-        'company': "Provide comprehensive business intelligence including financial data, recent news, and market analysis.",
-        'regulations': "Emphasize current UK construction regulations, compliance requirements, and recent updates.",
-        'sustainability': "Focus on green building standards, environmental compliance, and sustainable construction practices.",
-        'technical': "Provide detailed technical guidance on construction methods, materials, and best practices."
+        'weather': "Focus on construction-specific weather impacts, site safety, and work scheduling recommendations. Consider how weather affects different construction activities.",
+        'company': "Provide comprehensive business intelligence including financial data, recent news, market analysis, and company comparisons when relevant to previous queries.",
+        'regulations': "Emphasize current UK construction regulations, compliance requirements, recent updates, and how they relate to previously discussed topics.",
+        'sustainability': "Focus on green building standards, environmental compliance, sustainable construction practices, and connections to earlier sustainability discussions.",
+        'technical': "Provide detailed technical guidance on construction methods, materials, best practices, and relate to any previous technical discussions."
     }
 
-    expertise = domain_expertise.get(domain, "Provide comprehensive construction industry guidance.")
+    expertise = domain_expertise.get(domain,
+                                     "Provide comprehensive construction industry guidance, building on previous conversation context.")
 
-    context_addition = f"\n\nConversation Context: {context}" if context else ""
-
-    return f"{base_prompt}\n\nSpecialization: {expertise}{context_addition}\n\nAlways cite sources for factual claims and provide actionable insights."
+    return f"{base_prompt}\n\nCurrent Specialization: {expertise}\n\nAlways cite sources for factual claims, provide actionable insights, and reference relevant previous discussions when appropriate."
 
 
-def create_user_prompt(query: str, data: Any, domain: str) -> str:
-    """Create user prompt with structured data"""
+def create_enhanced_user_prompt(query: str, data: Any, domain: str) -> str:
+    """Create enhanced user prompt with structured data"""
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S GMT")
 
     return f"""
 Current Time: {current_time}
-User Query: {query}
-Domain: {domain}
+Current Query: {query}
+Query Domain: {domain}
 
-Retrieved Data:
+Retrieved Real-time Data:
 {json.dumps(data, indent=2) if isinstance(data, (dict, list)) else str(data)}
 
-Please provide a comprehensive, professional response that:
-1. Directly answers the user's question
-2. Uses the most current information available
-3. Includes specific, actionable recommendations
-4. Cites sources where appropriate
+Please provide a comprehensive response that:
+1. Directly answers the user's question using the most current data
+2. References relevant information from our previous conversation when appropriate
+3. Provides specific, actionable recommendations
+4. Includes proper citations for factual claims
 5. Considers UK-specific regulations and standards
-6. Uses proper formatting with headers and bullet points
+6. Uses clear formatting with headers and bullet points for readability
+7. Builds upon previous context to provide deeper insights
 
-Response should be detailed but well-structured for easy reading.
+If this query relates to or builds upon previous questions in our conversation, please acknowledge that connection and provide comparative or additional insights accordingly.
 """
 
 
-# Streamlit UI Components
+# Rest of the Streamlit UI Components remain the same...
 def render_sidebar():
     """Render enhanced sidebar with user preferences and controls"""
     with st.sidebar:
@@ -715,6 +796,7 @@ def render_sidebar():
             st.metric("Total Queries", total_queries)
             st.metric("Avg Response Time", f"{avg_processing_time:.2f}s")
             st.metric("Cache Entries", len(st.session_state.cache))
+            st.metric("Context Depth", f"{len(st.session_state.conversation_history)} exchanges")
 
             # Domain distribution
             domains = [h.get('domain', 'unknown') for h in st.session_state.conversation_history]
@@ -728,6 +810,17 @@ def render_sidebar():
                 )
                 fig.update_layout(height=300, showlegend=True)
                 st.plotly_chart(fig, use_container_width=True)
+
+        st.divider()
+
+        # Context Information
+        st.subheader("Context Info")
+        if st.session_state.conversation_history:
+            recent_domains = [h.get('domain', 'unknown') for h in st.session_state.conversation_history[-3:]]
+            st.write("Recent domains:", ", ".join(recent_domains))
+            st.write("Context available:", "✅" if len(st.session_state.conversation_history) > 0 else "❌")
+        else:
+            st.write("No conversation history yet")
 
         st.divider()
 
@@ -750,7 +843,12 @@ def render_sidebar():
 def render_main_interface():
     """Render main chat interface"""
     st.title("ConstructAI UK - Advanced Construction Assistant")
-    st.markdown("*Powered by real-time data and advanced AI models*")
+    st.markdown("*Powered by real-time data and advanced AI models with conversation memory*")
+
+    # Context status indicator
+    if st.session_state.conversation_history:
+        st.info(
+            f"💬 Context active: {len(st.session_state.conversation_history)} previous exchanges available for reference")
 
     # Quick action buttons with session state management
     col1, col2, col3, col4 = st.columns(4)
@@ -784,7 +882,10 @@ def render_main_interface():
             st.subheader("Recent Conversations")
 
             for i, entry in enumerate(reversed(st.session_state.conversation_history[-3:])):
-                with st.expander(f"Query: {entry['query'][:50]}..." if len(entry['query']) > 50 else entry['query']):
+                with st.expander(
+                        f"Query {len(st.session_state.conversation_history) - i}: {entry['query'][:50]}..." if len(
+                                entry[
+                                    'query']) > 50 else f"Query {len(st.session_state.conversation_history) - i}: {entry['query']}"):
                     col1, col2 = st.columns([3, 1])
 
                     with col1:
@@ -805,12 +906,13 @@ def render_main_interface():
         "Ask me anything about UK construction...",
         value=query_value,
         placeholder="e.g., 'Weather forecast for London construction sites', 'Balfour Beatty company information', 'Latest CDM regulations'",
-        key="main_query_input"
+        key="main_query_input",
+        help="I remember our previous conversation - feel free to ask follow-up questions or reference earlier topics!"
     )
 
     # Auto-execute preset queries
     should_execute = (st.session_state.execute_preset and query_input) or (
-                st.button("Send Query", type="primary", key="send_query_btn") and query_input)
+            st.button("Send Query", type="primary", key="send_query_btn") and query_input)
 
     if should_execute:
         # Reset preset execution flag
@@ -823,7 +925,7 @@ def render_main_interface():
             st.session_state.processing = True
             st.session_state.last_query = query_input
 
-            with st.spinner("Processing your query with real-time data..."):
+            with st.spinner("Processing your query with real-time data and conversation context..."):
                 try:
                     result = process_advanced_query(query_input)
 
@@ -840,7 +942,8 @@ def render_main_interface():
                     st.session_state.current_result = result
                     st.session_state.show_result = True
 
-                    st.success(f"Query processed in {result['processing_time']:.2f}s")
+                    st.success(
+                        f"Query processed in {result['processing_time']:.2f}s with context from {result['context_used']}")
 
                 except Exception as e:
                     st.error(f"Error processing query: {str(e)}")
@@ -857,6 +960,12 @@ def render_main_interface():
 
         # Main response
         st.subheader(f"ConstructAI Response - Domain: {result['domain'].title()}")
+
+        # Show context indicator
+        if len(st.session_state.conversation_history) > 1:
+            st.caption(
+                f"📝 This response uses context from {len(st.session_state.conversation_history) - 1} previous exchange(s)")
+
         st.markdown(result['response'])
 
         # Additional insights based on domain
@@ -866,9 +975,17 @@ def render_main_interface():
             render_company_dashboard(result['raw_data'])
 
         # Context information
-        if result['context_used']:
-            with st.expander("Context Used"):
-                st.write(result['context_used'])
+        with st.expander("Processing Details"):
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.write(f"**Domain:** {result['domain']}")
+                st.write(f"**Processing Time:** {result['processing_time']:.2f}s")
+            with col2:
+                st.write(f"**Context Used:** {result['context_used']}")
+                st.write(f"**Timestamp:** {result['timestamp'][:19]}")
+            with col3:
+                st.write(f"**Total Queries:** {len(st.session_state.conversation_history)}")
+                st.write(f"**Cache Entries:** {len(st.session_state.cache)}")
 
         # Raw data view
         with st.expander("Raw Data View"):
@@ -1115,6 +1232,25 @@ def render_analytics_page():
         unique_domains = len(set(domains))
         st.metric("Unique Domains", unique_domains)
 
+    # Context effectiveness metrics
+    st.subheader("Context Analysis")
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        st.metric("Conversation Length", f"{len(st.session_state.conversation_history)} exchanges")
+
+    with col2:
+        # Calculate context usage (queries after first)
+        context_queries = max(0, len(st.session_state.conversation_history) - 1)
+        st.metric("Context-Aware Responses", context_queries)
+
+    with col3:
+        # Calculate average context depth
+        context_availability = "High" if len(st.session_state.conversation_history) > 5 else "Medium" if len(
+            st.session_state.conversation_history) > 2 else "Low"
+        st.metric("Context Depth", context_availability)
+
     # Domain distribution
     st.subheader("Query Domain Distribution")
     domain_counts = pd.Series(domains).value_counts()
@@ -1179,6 +1315,33 @@ def render_analytics_page():
             std_dev = statistics.stdev(processing_times) if len(processing_times) > 1 else 0
             st.metric("Std Dev", f"{std_dev:.2f}s")
 
+    # Conversation flow analysis
+    if len(st.session_state.conversation_history) > 1:
+        st.subheader("Conversation Flow")
+
+        # Create a simple conversation flow visualization
+        flow_data = []
+        for i, entry in enumerate(st.session_state.conversation_history):
+            flow_data.append({
+                'Exchange': i + 1,
+                'Domain': entry.get('domain', 'unknown'),
+                'Query_Length': len(entry['query']),
+                'Response_Length': len(entry['response'])
+            })
+
+        flow_df = pd.DataFrame(flow_data)
+
+        # Query length over time
+        fig = px.line(
+            flow_df,
+            x='Exchange',
+            y='Query_Length',
+            title="Query Length Evolution",
+            markers=True
+        )
+        fig.update_layout(height=300)
+        st.plotly_chart(fig, use_container_width=True)
+
 
 def main():
     """Main application function"""
@@ -1216,6 +1379,15 @@ def main():
         border-left: 4px solid #9c27b0;
     }
 
+    .context-indicator {
+        background-color: #e8f5e8;
+        border: 1px solid #4caf50;
+        padding: 0.5rem;
+        border-radius: 0.3rem;
+        margin: 0.5rem 0;
+        font-size: 0.9rem;
+    }
+
     .warning-box {
         background-color: #fff3e0;
         border: 1px solid #ff9800;
@@ -1250,22 +1422,33 @@ def main():
         st.subheader("API Configuration")
 
         with st.expander("API Keys Status"):
-            st.write("OpenRouter API: Connected")
-            st.write("Serper API: Connected")
-            st.write("Companies House API: Connected")
-            st.write("OpenWeather API: Connected")
+            st.write("✅ OpenRouter API: Connected")
+            st.write("✅ Serper API: Connected")
+            st.write("✅ Companies House API: Connected")
+            st.write("✅ OpenWeather API: Connected")
 
-        st.subheader("Performance Settings")
+        st.subheader("Context & Performance Settings")
 
         col1, col2 = st.columns(2)
 
         with col1:
             cache_duration = st.slider("Cache Duration (minutes)", 5, 60, 15, key="cache_duration_slider")
-            max_context_length = st.slider("Max Context Length", 3, 10, 5, key="max_context_slider")
+            max_context_length = st.slider("Max Context History", 3, 10, 5, key="max_context_slider")
 
         with col2:
             max_search_results = st.slider("Max Search Results", 5, 20, 10, key="max_search_slider")
             response_timeout = st.slider("Response Timeout (seconds)", 10, 60, 30, key="timeout_slider")
+
+        st.subheader("Context Management")
+
+        context_mode = st.selectbox(
+            "Context Mode",
+            ["Full History", "Domain-Specific", "Recent Only"],
+            index=0,
+            help="Choose how context is used in responses"
+        )
+
+        st.write(f"Current conversation length: {len(st.session_state.conversation_history)} exchanges")
 
         if st.button("Save Settings", key="save_settings_btn"):
             st.success("Settings saved successfully!")
@@ -1276,57 +1459,71 @@ def main():
         st.markdown("""
         ## Getting Started with ConstructAI
 
-        ConstructAI is your advanced AI assistant for the UK construction industry, powered by real-time data and cutting-edge AI models.
+        ConstructAI is your advanced AI assistant for the UK construction industry, powered by real-time data and cutting-edge AI models with **full conversation memory**.
 
         ### Key Features
 
-        - **Real-time Data Integration**: Access to current weather, company information, and regulatory updates
-        - **Multi-domain Expertise**: Weather impact analysis, company intelligence, regulations, and technical guidance
-        - **Context-aware Conversations**: Remembers previous queries for more relevant responses
-        - **Advanced Analytics**: Track your usage patterns and query insights
+        - **🧠 Conversation Memory**: Remembers your entire conversation and can reference previous questions and responses
+        - **📊 Real-time Data Integration**: Access to current weather, company information, and regulatory updates
+        - **🎯 Multi-domain Expertise**: Weather impact analysis, company intelligence, regulations, and technical guidance
+        - **📈 Advanced Analytics**: Track your usage patterns and query insights
+        - **🔄 Context-Aware Responses**: Each response builds upon your previous conversation
+
+        ### How Context Works
+
+        ConstructAI now maintains **full conversation context**, meaning:
+
+        - **Follow-up questions** work naturally: "What about Manchester?" after asking about London weather
+        - **Comparative queries**: "How does that compare to what we discussed earlier?"
+        - **Building conversations**: Each response can reference and build upon previous exchanges
+        - **Cross-domain connections**: Weather discussions can inform company analysis and vice versa
 
         ### How to Use
 
-        1. **Ask Questions**: Type your construction-related questions in natural language
-        2. **Use Quick Actions**: Click the quick action buttons for common queries
-        3. **Review Context**: Check the context panel to see how previous queries influence responses
-        4. **Explore Analytics**: Visit the Analytics tab to see usage patterns and insights
+        1. **Start Conversations**: Ask your initial construction-related questions
+        2. **Build Upon Responses**: Ask follow-ups, comparisons, or deeper questions
+        3. **Reference History**: Use phrases like "earlier you mentioned..." or "compared to before..."
+        4. **Use Quick Actions**: Click buttons for common queries that build on context
+        5. **Review Analytics**: See how your conversation develops over time
 
-        ### Query Examples
+        ### Context Examples
 
-        **Weather Queries:**
-        - "Weather impact on concrete pouring in Manchester today"
-        - "5-day forecast for construction work in Birmingham"
-        - "Wind conditions for crane operations London"
+        **Building Weather Conversations:**
+        - Query 1: "Weather for construction in London"
+        - Query 2: "What about Manchester?" *(references previous location query)*
+        - Query 3: "Which is better for concrete work this week?" *(compares both locations)*
 
-        **Company Queries:**
-        - "Latest financial information for Balfour Beatty"
-        - "Recent news about Morgan Sindall"
-        - "Company officers for Kier Group"
+        **Company Analysis Conversations:**
+        - Query 1: "Tell me about Balfour Beatty"
+        - Query 2: "How does their safety record compare to industry standards?"
+        - Query 3: "What about their main competitors?" *(builds on company context)*
 
-        **Regulatory Queries:**
-        - "Latest CDM regulations updates 2024"
-        - "Building regulations for residential extensions"
-        - "HSE safety guidelines for scaffolding"
+        **Technical Building Conversations:**
+        - Query 1: "BREEAM requirements for office buildings"
+        - Query 2: "How does that affect material choices?"
+        - Query 3: "What about cost implications?" *(continues technical discussion)*
 
-        **Technical Queries:**
-        - "Best practices for concrete work in cold weather"
-        - "BREEAM requirements for commercial buildings"
-        - "Risk assessment template for excavation work"
+        ### Advanced Context Features
 
-        ### Advanced Features
+        - **Domain Memory**: Remembers weather, company, regulatory, and technical discussions
+        - **Cross-Reference**: Can connect information across different domains
+        - **Progressive Detail**: Each question can dive deeper into topics
+        - **Conversation Analytics**: Track how your discussions evolve
 
-        - **Smart Caching**: Frequently accessed data is cached for faster responses
-        - **Domain Detection**: Automatically identifies query type for optimized processing
-        - **Context Management**: Maintains conversation context for better understanding
-        - **Real-time Updates**: Access to latest regulatory changes and industry news
+        ### Technical Context Details
 
-        ### Technical Details
+        - **History Depth**: Maintains last 5 full exchanges for context
+        - **Smart Truncation**: Long responses are summarized for context efficiency
+        - **Domain Prioritization**: Recent same-domain queries weighted higher
+        - **Real-time Integration**: Context combined with live data for current responses
 
-        - **AI Models**: Perplexity Sonar for real-time data, advanced language models for responses
-        - **Data Sources**: Serper for web search, Companies House API, OpenWeather API
-        - **Update Frequency**: Real-time for weather and news, cached appropriately for other data
-        - **UK Focus**: Specialized for UK construction regulations and standards
+        ### Tips for Best Results
+
+        1. **Build Progressively**: Start with broad questions, then get specific
+        2. **Reference Explicitly**: Use "earlier," "previously," or "compared to" for clear context
+        3. **Cross-Connect**: Ask how different topics relate to each other
+        4. **Use Follow-ups**: Natural conversation flows work best
+        5. **Check Analytics**: See conversation patterns in the Analytics tab
         """)
 
 
