@@ -13,7 +13,6 @@ import plotly.graph_objects as go
 import pandas as pd
 from dotenv import load_dotenv
 
-
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -26,8 +25,9 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-
 load_dotenv()
+
+
 # API Configuration - Try Streamlit secrets first, then environment variables
 def get_api_key(key_name):
     """Get API key from Streamlit secrets or environment variables"""
@@ -37,6 +37,7 @@ def get_api_key(key_name):
     except:
         # Fallback to environment variables (for local development)
         return os.getenv(key_name)
+
 
 # Get API keys securely
 SERPER_API_KEY = get_api_key("SERPER_API_KEY")
@@ -60,6 +61,7 @@ if missing_keys:
     st.info("If running locally, ensure your .env file is properly configured.")
     st.info("If running on Streamlit Cloud, check your secrets configuration.")
     st.stop()
+
 
 # Initialize session state variables
 def init_session_state():
@@ -85,6 +87,10 @@ def init_session_state():
         st.session_state.show_result = False
     if 'current_result' not in st.session_state:
         st.session_state.current_result = None
+    if 'preset_query' not in st.session_state:
+        st.session_state.preset_query = ""
+    if 'execute_preset' not in st.session_state:
+        st.session_state.execute_preset = False
 
 
 # Enhanced company database
@@ -746,26 +752,28 @@ def render_main_interface():
     st.title("ConstructAI UK - Advanced Construction Assistant")
     st.markdown("*Powered by real-time data and advanced AI models*")
 
-    # Quick action buttons - NO st.rerun() calls
+    # Quick action buttons with session state management
     col1, col2, col3, col4 = st.columns(4)
-
-    quick_query = None
 
     with col1:
         if st.button("Weather Impact", key="weather_btn"):
-            quick_query = f"Weather impact on construction work in {st.session_state.user_preferences['location_preference']}"
+            st.session_state.preset_query = f"Weather impact on construction work in {st.session_state.user_preferences['location_preference']}"
+            st.session_state.execute_preset = True
 
     with col2:
         if st.button("Latest CDM Updates", key="cdm_btn"):
-            quick_query = "Latest CDM regulations updates 2024"
+            st.session_state.preset_query = "Latest CDM regulations updates 2024"
+            st.session_state.execute_preset = True
 
     with col3:
         if st.button("BREEAM Guidelines", key="breeam_btn"):
-            quick_query = "Latest BREEAM sustainability guidelines"
+            st.session_state.preset_query = "Latest BREEAM sustainability guidelines"
+            st.session_state.execute_preset = True
 
     with col4:
         if st.button("Safety Alerts", key="safety_btn"):
-            quick_query = "Latest HSE construction safety alerts"
+            st.session_state.preset_query = "Latest HSE construction safety alerts"
+            st.session_state.execute_preset = True
 
     # Main chat interface
     st.subheader("Chat with ConstructAI")
@@ -790,16 +798,26 @@ def render_main_interface():
                         st.metric("Time", f"{entry.get('processing_time', 0):.2f}s")
                         st.write(f"*{entry.get('timestamp', '')[:19]}*")
 
-    # Query input - use session state to maintain quick query value
+    # Query input with preset query handling
+    query_value = st.session_state.preset_query if st.session_state.execute_preset else ""
+
     query_input = st.text_input(
         "Ask me anything about UK construction...",
-        value=quick_query if quick_query else "",
+        value=query_value,
         placeholder="e.g., 'Weather forecast for London construction sites', 'Balfour Beatty company information', 'Latest CDM regulations'",
         key="main_query_input"
     )
 
-    # Process query button
-    if st.button("Send Query", type="primary", key="send_query_btn") and query_input:
+    # Auto-execute preset queries
+    should_execute = (st.session_state.execute_preset and query_input) or (
+                st.button("Send Query", type="primary", key="send_query_btn") and query_input)
+
+    if should_execute:
+        # Reset preset execution flag
+        if st.session_state.execute_preset:
+            st.session_state.execute_preset = False
+            st.session_state.preset_query = ""
+
         # Prevent duplicate processing
         if not st.session_state.processing and query_input != st.session_state.last_query:
             st.session_state.processing = True
@@ -830,6 +848,8 @@ def render_main_interface():
 
                 finally:
                     st.session_state.processing = False
+                    # Rerun to show results immediately
+                    st.rerun()
 
     # Display current result if available
     if st.session_state.get('show_result') and st.session_state.get('current_result'):
@@ -858,6 +878,7 @@ def render_main_interface():
         if st.button("Clear Current Response", key="clear_response_btn"):
             st.session_state.show_result = False
             st.session_state.current_result = None
+            st.rerun()
 
 
 def render_weather_dashboard(weather_data: Dict):
